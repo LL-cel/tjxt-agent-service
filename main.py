@@ -35,8 +35,14 @@ async def start_web():
 # ========================= 项目入口 =========================
 if __name__ == "__main__":
     # ⚠️ Windows 上需要使用 SelectorEventLoop 才能兼容 psycopg 异步
-    loop = asyncio.SelectorEventLoop(selector=selectors.SelectSelector())
-    asyncio.set_event_loop(loop)
-
-    # 执行异步主入口
-    loop.run_until_complete(main())
+    try:
+        # Runner 在退出时清理剩余任务、异步生成器和线程池，并关闭事件循环
+        with asyncio.Runner(
+            loop_factory=lambda: asyncio.SelectorEventLoop(
+                selector=selectors.SelectSelector()
+            )
+        ) as runner:
+            runner.run(main())
+    except KeyboardInterrupt:
+        # Uvicorn 完成优雅关闭后会重新触发 SIGINT，按正常停止处理
+        pass
