@@ -1,9 +1,11 @@
-from agent.tianji.RouteState import RouteState
+from agent.prompts import system_prompt_config
+from agent.tianji.nodes.BaseNodeAgent import BaseNodeAgent
 
-class RecommendAgent:
+
+class RecommendAgent(BaseNodeAgent):
     """
     课程推荐智能体
     """
 
-    async def execute(self, state: RouteState):
-        pass
+    def system_prompt(self):
+        return system_prompt_config.chat_recommend_message

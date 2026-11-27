@@ -1,12 +1,19 @@
+import uuid
 from typing import AsyncIterable
 
-from fastapi import APIRouter
+from apscheduler.executors import asyncio
+from fastapi import APIRouter, HTTPException
+from dao import chat_session_dao
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel
 
-from agent.BaseAgent import make_sse_event  # SSE 事件格式化工具
+from agent.BaseAgent import make_sse_event, format_sse_data, STOP_EVENT  # SSE 事件格式化工具
+from agent.tianji.tools.result import CourseInfo, PrePlaceOrder
 from config import logger
 from agent import AGENTS  # 全局智能体实例字典
+from util import JsonUtil
 
 # ========================= 创建路由对象 =========================
 chat_router = APIRouter()
@@ -19,6 +26,7 @@ class ChatRequest(BaseModel):
     question: str      # 用户提出的问题
     sessionId: str     # 会话ID，用于关联上下文
     userToken: str     # 用户身份token，用于调用业务系统接口
+    userId: int | None = None
     agentId: int = 1001  # 智能体ID，默认1001
 
 # ========================= SSE 错误流 =========================
@@ -57,4 +65,29 @@ async def chat(req: ChatRequest):
         return stream(error_stream(error_msg))  # 返回错误 SSE 流
 
     # 返回智能体生成的流式 SSE
+    if req.agentId == 1001 and req.userId is not None:
+        if not chat_session_dao.owns_session(req.agentId, req.userId, req.sessionId):
+            raise HTTPException(status_code=404, detail="会话不存在")
     return stream(agent.execute(req.question, req.sessionId, req.userToken))
+
+# ========================= 停止会话接口 =========================
+@chat_router.post("/stop")
+def stop(session_id: str, agent_id: int, user_id: int | None = None):
+    """
+    停止指定 session 的对话：
+    - 根据 agent_id 获取智能体
+    - 调用 agent.stop(session_id) 停止该会话
+    """
+    logger.debug(f"【ChatRouter】收到停止请求：sessionId = {session_id}")
+
+    # 获取智能体
+    agent = AGENTS.get(agent_id, None)
+    if agent is None:
+        error_msg = f"Agent not found (agentId={agent_id})"
+        return {"status": "ok", "message": error_msg}
+
+    # 停止会话
+    if user_id is not None and not chat_session_dao.owns_session(agent_id, user_id, session_id):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    agent.stop(session_id)
+    return {"status": "ok"}  # 返回成功状态

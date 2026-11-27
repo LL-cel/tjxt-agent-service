@@ -1,12 +1,17 @@
 from abc import ABC, abstractmethod
 from typing import AsyncIterable, Any
 
+from config import redis_config
 from util import JsonUtil
 
 # ------------------ 常量 ------------------
 
 STOP_EVENT = {"eventType": 1002}   # 标准 SSE 停止事件结构，用于前端识别结束信号
 
+# ------------------ Redis 客户端 ------------------
+
+redis = redis_config.get_instance()  # 获取 Redis 实例，用于会话控制
+STOP_FLAG_TTL = 120  # 停止标记的超时时间（秒），防止永久残留
 
 # ------------------ SSE 格式化工具方法 ------------------
 
@@ -99,3 +104,39 @@ class BaseAgent(ABC):
         在服务退出或 Agent 卸载时触发。
         """
         pass
+# ------------------ Redis 停止标记管理 ------------------
+
+    def stop(self, session_id: str):
+        """
+        标记该会话为“停止输出”。
+
+        通常由前端用户主动触发，用于：
+        - 停止流式响应（SSE）
+        - 中断大模型输出
+
+        标记存储于 Redis，并自动过期。
+        """
+        redis.setex(self.get_flags_key(session_id), STOP_FLAG_TTL, "1")
+
+    def get_flags_key(self, session_id: str):
+        """
+        构建当前 Agent 针对某会话的 Redis 停止标记 key。
+
+        Key 格式示例：
+        AGENT_CENTER_STOP_FLAGS:<agent_id>:<session_id>
+        """
+        return f"AGENT_CENTER_STOP_FLAGS:{self.id()}:{session_id}"
+
+    def reset_stop(self, session_id: str):
+        """
+        清除停止标记，使会话恢复可输出状态。
+        """
+        redis.delete(self.get_flags_key(session_id))
+
+    def is_stop(self, session_id: str):
+        """
+        检查当前会话是否存在停止标记。
+
+        返回 True 表示 SSE 流应立即终止，不再继续输出。
+        """
+        return redis.exists(self.get_flags_key(session_id))

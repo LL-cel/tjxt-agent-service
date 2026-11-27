@@ -2,20 +2,21 @@ import uuid
 import asyncio
 from typing import Optional
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.constants import START, END
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from agent.BaseAgent import *
 from agent.tianji.nodes import *
 from agent.tianji.RouteState import RouteState
-from config import logger
+from config import logger, get_async_pg_pool
 from common import *
-
-
-from agent.BaseAgent import *
+from langgraph.types import StateSnapshot
+from agent.tianji.tools.result import CourseInfo, PrePlaceOrder
+from dao import chat_session_dao
 
 
 class RouterAgent(BaseAgent):
@@ -29,14 +30,49 @@ class RouterAgent(BaseAgent):
     - 持久化每个会话的状态（使用 LangGraph + Postgres Checkpointer）
     """
 
+    # 声明用于 Graph 的所有节点智能体（节点 = 子 Agent）
+    AGENTS = {
+        "intent_agent": IntentAgent(),
+        "recommend_agent": RecommendAgent(),
+        "buy_agent": BuyAgent(),
+        "consult_agent": ConsultAgent(),
+        "knowledge_agent": KnowledgeAgent(),
+        "unknown_agent": UnknownAgent(),
+    }
+
     def __init__(self):
         self.graph: Optional[CompiledStateGraph] = None
+        self.checkpointer: Optional[AsyncPostgresSaver] = None  # 用于保存会话状态的 Postgres Checkpointer
 
     async def init(self):
         """
         初始化 RouterAgent
         """
+        # 检查会话记忆所需要的表是否存在
+        await self.check_table()
+
+        # 获取异步数据库连接池实例
+        async_pg_pool = await get_async_pg_pool()
+        # 创建checkpointer是用于实现会话记忆的
+        self.checkpointer = AsyncPostgresSaver(conn=async_pg_pool)
+
         self.init_graph()
+
+    async def check_table(self):
+        """
+        检查数据库中是否存在会话记忆相关的表，如果不存在则创建
+        """
+        async_pg_pool = await get_async_pg_pool()
+        conn = None
+        try:
+            # 先创建一个临时checkpointer，用于检查数据库中相关的表是否存在，如果不存在则创建
+            conn = await async_pg_pool.getconn()
+            await conn.set_autocommit(True) # 设置自动提交，不使用显式事务块
+            checkpointer = AsyncPostgresSaver(conn=conn)
+            await checkpointer.setup()  # 如果会话记忆相关的表不存在，会自动创建
+        finally:
+            if conn is not None:
+                await async_pg_pool.putconn(conn)
 
     # ---------------- Graph 初始化 ----------------
     def init_graph(self):
@@ -49,7 +85,7 @@ class RouterAgent(BaseAgent):
         builder = StateGraph(RouteState)  # RouteState 用于定义 Graph 中的状态结构
 
         # 添加所有节点到 Graph（每个节点绑定对应智能体的 execute()）
-        for name, agent in self.INTENT_MAPS.items():
+        for name, agent in self.AGENTS.items():
             builder.add_node(name, agent.execute)
 
         # 设置图的起点：首先进入意图识别
@@ -69,16 +105,22 @@ class RouterAgent(BaseAgent):
             builder.add_edge(target, END)
 
         # 编译 Graph，并启用 Checkpointer
-        self.graph = builder.compile()
+        self.graph = builder.compile(checkpointer=self.checkpointer)
 
     async def execute(self, question: str, session_id: str, user_token: str) -> AsyncIterable[str]:
         try:
             request_id = uuid.uuid4().hex
 
+            # 清除停止标记
+            self.reset_stop(session_id)
+
+            # 更新会话标题
+            chat_session_dao.update_title(session_id, self.id(), question)
+
             # 构建 Graph 执行上下文
             config = RunnableConfig(configurable={
                 "thread_id": session_id,
-                "user_token": user_token, # 将自定义参数传递给子智能体
+                "user_token": user_token,  # 将自定义参数传递给子智能体
                 "request_id": request_id  # 将自定义参数传递给子智能体
             })
 
@@ -89,18 +131,51 @@ class RouterAgent(BaseAgent):
             res = self.graph.astream(
                 input=inputs,
                 config=config,
-                subgraphs=True, # 需要得到子图的输出
+                subgraphs=True,  # 需要得到子图的输出
                 stream_mode="messages",
             )
 
+            # 工具调用的执行结果
+            tool_result = {}
+
             try:
                 async for node_info, (message, metadata) in res:
+                    if self.is_stop(session_id):
+                        await res.aclose()
+                        break
+
+                    # 获取消息 tags（例如 IntentAgent）
+                    tags = metadata.get("tags", [])
+
+                    # 主动跳过 IntentAgent 阶段输出
+                    if "IntentAgent" in tags:
+                        continue
+
+                    # ToolMessage 是工具输出，不对用户显示
+                    if isinstance(message, ToolMessage):
+                        if not message.status == "success":
+                            continue
+                        _content = message.content
+                        if _content:
+                            if message.name == "query_course_by_id":
+                                course_info = JsonUtil.to_obj(_content, CourseInfo)
+                                tool_result[f"courseInfo_{course_info.id}"] = course_info
+                            elif message.name == "pre_place_order":
+                                order = JsonUtil.to_obj(_content, PrePlaceOrder)
+                                tool_result["prePlaceOrder"] = order
+
+                        continue
+
                     # 提取 message 内容
                     content = getattr(message, "content", None)
                     if not content:
                         continue
                     # SSE 输出文本事件
                     yield make_sse_event(1001, content)
+                else:
+                    # 只有正常结束的对话才发送汇总的工具结果。
+                    if tool_result and not self.is_stop(session_id):
+                        yield make_sse_event(1003, tool_result)
             except asyncio.CancelledError:
                 # 客户端中断，也需要安全关闭流
                 await res.aclose()
@@ -114,18 +189,58 @@ class RouterAgent(BaseAgent):
         yield format_sse_data(STOP_EVENT)
 
     def id(self) -> int:
-        """
-        RouterAgent 的固定 ID。
-        """
         return 1001
 
     async def session_detail(self, user_id: int, session_id: str) -> list:
-        """暂不实现"""
-        pass
+        """
+        查询指定 session 的消息历史（从 LangGraph 的 Checkpointer 中恢复）。
+
+        同时会自动解析 ToolMessage，用于还原“查询课程/预下单”的参数结构。
+        """
+        config = RunnableConfig(configurable={"thread_id": session_id})
+        state_snapshot: StateSnapshot = await self.graph.aget_state(config)
+        messages = state_snapshot.values.get("messages", [])
+
+        result = []
+        tool_message: Optional[ToolMessage] = None
+
+        for message in messages:
+            msg_type = ""
+            content = message.content
+            params = {}
+
+            # 用户消息
+            if isinstance(message, HumanMessage):
+                msg_type = "USER"
+
+            # 模型回复消息
+            elif isinstance(message, AIMessage):
+                msg_type = "ASSISTANT"
+
+                # 如果 AIMessage 紧随 ToolMessage，恢复工具返回内容
+                if tool_message:
+                    _content = tool_message.content
+                    if tool_message.name == "query_course_by_id":
+                        course_info = JsonUtil.to_obj(_content, CourseInfo)
+                        params = {f"courseInfo_{course_info.id}": course_info}
+                    elif tool_message.name == "pre_place_order":
+                        order = JsonUtil.to_obj(_content, PrePlaceOrder)
+                        params = {"prePlaceOrder": order}
+                    tool_message = None
+
+            # 工具调用消息（需要保留，下一条 AIMessage 会用到）
+            elif isinstance(message, ToolMessage):
+                tool_message = message
+
+            # 将有效消息加入结果结构
+            if msg_type and content:
+                result.append({"type": msg_type, "content": content, "params": params})
+
+        return result
 
     async def delete_session(self, session_id: str):
-        """暂不实现"""
-        pass
+        """删除会话历史数据（清理 LangGraph 的 PostgreSQL 检查点）"""
+        await self.checkpointer.adelete_thread(session_id)
 
 # 全局 RouterAgent 实例
 router_agent = RouterAgent()
